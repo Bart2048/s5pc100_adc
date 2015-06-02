@@ -1,0 +1,1 @@
+cmd_/home/ubuntu/work/modules/char/adc/adc.ko := arm-cortex_a8-linux-gnueabi-ld -EL -r  -T /home/ubuntu/work/linux-2.6.35-farsight/scripts/module-common.lds --build-id -o /home/ubuntu/work/modules/char/adc/adc.ko /home/ubuntu/work/modules/char/adc/adc.o /home/ubuntu/work/modules/char/adc/adc.mod.o
