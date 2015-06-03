@@ -23,6 +23,11 @@
 // interrupt
 #include <linux/interrupt.h>
 
+// wait queue
+#include <linux/wait.h>
+#include <linux/sched.h>
+// noblock
+#include <linux/poll.h>
 
 // hardware : 定义寄存器的偏移 
 #define ADCCON 0x0
@@ -37,42 +42,98 @@ struct adc_cdev{
     struct resource *res;// resource : 申请的物理地址
     struct clk *clk; //hardware : 时钟
     int irqno;
+
+    // 分配中断队列内存
+    wait_queue_head_t readq;
 };
 // mknod : adc全局类
 struct class *adc_class;
 
-/*// char : 定义存放主设备号参数的变量*/
-/*dev_t adc_major = 250;*/
-/*module_param(adc_major, int, 0400);*/
-/*MODULE_PARM_DESC(adc_major, "adc device major");*/
-
-// hardware : adc_dev_init
-void adc_dev_init(struct adc_cdev *adc, int minor)
+// hardware : adc_dev_init :: 硬件初始化完成自动产生一次中断
+void adc_dev_init(struct adc_cdev *adc)
 {
     unsigned long ADC_CON;    
-    unsigned long ADC_DAT;
     unsigned long ADC_MUX;
-    unsigned long ADC_CLRINT;
+    printk("adc->regs = %p\n", adc->regs);
 
     ADC_CON = readl(adc->regs + ADCCON);    
-    ADC_CON = (1 << 16) | (1 << 14) | (65 << 6);
+    ADC_CON |= 0x1 << 1;
+    ADC_CON &= ~(0x1 << 2);
+    ADC_CON |= 0xff << 6;
+    ADC_CON |= 0x1 << 14;
+    ADC_CON |= 0x1 << 16;
     writel(ADC_CON, adc->regs + ADCCON);
 
-    ADC_DAT = readl(adc->regs + ADCDAT);
-    ADC_DAT = 0;
-    writel(ADC_DAT, adc->regs + ADCDAT);
-
+    // 选择mux
     ADC_MUX = readl(adc->regs + ADCMUX);
     ADC_MUX &= ~(0xf);
     writel(ADC_MUX, adc->regs + ADCMUX);
 
-    ADC_CLRINT = readl(adc->regs + ADC_CLRINT);
-    ADC_CLRINT = 0; 
-    writel(ADC_CLRINT, adc->regs + ADCCLRINT);
+    // 读使能enable
+    readl(adc->regs + ADCDAT);
 
-    
 }
 
+// hardware : adc_dev_read
+int adc_dev_read(struct adc_cdev *adc)
+{
+    printk("%s\n", __func__);
+    return (readl(adc->regs + ADCDAT) & 0xfff);
+}
+
+// hardware : adc_dev_set_resolution
+void adc_dev_set_resoulution(struct adc_cdev *adc, int resolution)
+{
+    unsigned long ADC_CON;
+
+    ADC_CON = readl(adc->regs + ADCCON);
+    if (12 == resolution){
+        ADC_CON |= (0x1 << 16);
+    }else{
+        ADC_CON &= ~(0x1 << 16);
+    }
+    writel(ADC_CON, adc->regs + ADCCON);
+}
+
+// hardware : 判断DATA寄存器是否值
+int adc_dev_is_finished(struct adc_cdev *adc)
+{
+    return (readl(adc->regs + ADCCON) & (0x1 << 15));
+}
+
+// hardware : 中断处理程序
+irqreturn_t adc_irq_handler(int irq, void *pdev)
+{
+    struct adc_cdev *adc = (struct adc_cdev *)pdev;
+
+    wake_up_interruptible(&adc->readq);
+
+    // 清除pending
+    writel(0, adc->regs + ADCCLRINT);
+
+    return IRQ_HANDLED;
+}
+
+// hardware : poll
+unsigned int adc_poll(struct file *filp, poll_table *wait)
+{
+    unsigned int mask = 0;
+    struct adc_cdev *adc = (struct adc_cdev *)filp->private_data;
+
+    printk("%s\n", __func__);
+
+    poll_wait(filp, &adc->readq, wait);
+
+    // 可读
+    if (adc_dev_is_finished(adc)){
+        mask |= POLLIN | POLLRDNORM;
+    }
+    /*// 可写*/
+    /*if (...){*/
+        /*mask |= POLLOUT | POLLWRNORM;*/
+    /*}*/
+    return mask;
+}
 // char : adc_open
 int adc_open(struct inode *inode, struct file *filp)
 {
@@ -81,30 +142,49 @@ int adc_open(struct inode *inode, struct file *filp)
     printk("%s\n", __func__);
     return 0;
 }
+
 // char : adc_release
 int adc_release(struct inode *inode, struct file *filp)
 {
     printk("%s\n", __func__);
     return 0;
 }
+
 // char : adc_read
 ssize_t adc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_ops)
 {
     ssize_t ret;
-    int data;
+    size_t vol;
     struct adc_cdev *adc = filp->private_data; 
     printk("%s\n", __func__);
-    ret = copy_to_user(buf, adc->regs + ADCDAT, 32);
+
+#if 1  // block
+    if (!(filp->f_flags & O_NONBLOCK)){
+        ret = wait_event_interruptible(adc->readq, adc_dev_is_finished(adc));
+        if (ret < 0){
+            goto exit;
+        }
+    }else{ // noblock
+        if (!adc_dev_is_finished(adc)){
+            ret = -EAGAIN;
+            goto exit;
+        }
+
+    }
+#endif
+
+    vol = adc_dev_read(adc);
+
+    ret = copy_to_user(buf, &vol, sizeof(vol));
     if (0 != ret){
         ret = -EFAULT;
+    }else{
+        ret = vol;
     }
-    data = atoi(buf);
-    data &= (0xfff);
-
-
-
+exit:
     return ret;
 }
+
 // char : adc_ioctl
 long adc_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
@@ -120,21 +200,17 @@ long adc_unlocked_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     }
     return ret;
 }
+
 // char : 供系统调用的函数
 const struct file_operations fops = {
     .open = adc_open,
     .release = adc_release,
     .read = adc_read,
     .unlocked_ioctl = adc_unlocked_ioctl,
+    .poll = adc_poll,
 };
-// hardware : 中断处理程序
-irqreturn_t adc_irq_handler(int irq, void *dev_id)
-{
-    return 0;
-}
 
-
-// bus : adc_probe 
+// bus : adc_probe  ::::注意时钟初始化与使能的位置:::尽量靠前
 int adc_probe(struct platform_device *pdev) 
 {
     int ret = 0; 
@@ -152,6 +228,17 @@ int adc_probe(struct platform_device *pdev)
 
     // char : 将驱动数据放入平台设备
     platform_set_drvdata(pdev, adc);
+
+    // hardware : 获取时钟
+    adc->clk = clk_get(&pdev->dev, "adc");
+    if (IS_ERR(adc->clk)){
+        ret = PTR_ERR(adc->clk);
+        goto err_clk_get;
+    }
+
+    // hardware : 使能时钟
+    clk_enable(adc->clk);
+    printk("clk is OK\n");
 
     // resource : 获取寄存器资源
     res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -179,7 +266,8 @@ int adc_probe(struct platform_device *pdev)
     printk("adc->regs = <%p>\n", adc->regs);
 
     // hardware : adc_dev_init
-    adc_dev_init(adc, 0);
+    adc_dev_init(adc);
+    init_waitqueue_head(&adc->readq);
 
     // char : 初始化(描述)字符设备(属性与操作)
     cdev_init(&adc->cdev, &fops);
@@ -198,22 +286,11 @@ int adc_probe(struct platform_device *pdev)
     }
 
     // mknod : 建立设备并注册到sysfs中
-    device = device_create(adc_class, NULL, adc->devno, NULL, "adc%d", pdev->id);
+    device = device_create(adc_class, NULL, adc->devno, NULL, "adc");
     if (IS_ERR(device)){
         ret = PTR_ERR(device);
         goto err_device_create;
     }
-
-    // hardware : 获取时钟
-    adc->clk = clk_get(&pdev->dev, "adc");
-    if (IS_ERR(adc->clk)){
-        ret = PTR_ERR(adc->clk);
-        goto err_clk_get;
-    }
-
-    // hardware : 使能时钟
-    clk_enable(adc->clk);
-    printk("clk is OK\n");
 
     // hardware : 获得中断号
     ret = platform_get_irq(pdev, 0);
@@ -224,7 +301,7 @@ int adc_probe(struct platform_device *pdev)
     printk("%s : irqno = %d\n", __func__, ret);
     adc->irqno = ret;
     // hardware : 注册中断程序
-    ret = request_irq(adc->irqno, adc_irq_handler, IRQF_TRIGGER_FALLING, "adc", pdev);
+    ret = request_irq(adc->irqno, adc_irq_handler, IRQF_DISABLED, "adc", adc);
     if (ret < 0){
         printk("err_request_irq\n");
         goto err_request_irq;
@@ -233,9 +310,8 @@ int adc_probe(struct platform_device *pdev)
     goto exit;
 
 err_request_irq:
-    free_irq(adc->irqno, pdev);
+    free_irq(adc->irqno, adc);
 err_platform_get_irq:
-err_clk_get:
 err_device_create:
     cdev_del(&adc->cdev);
 
@@ -251,9 +327,11 @@ err_request_mem_region:
 err_platform_get_resource:
     kfree(adc);
 
+err_clk_get:
 exit:
     return ret;
 }
+
 // bus : adc_remove 
 int adc_remove(struct platform_device *pdev)
 {
@@ -266,11 +344,8 @@ int adc_remove(struct platform_device *pdev)
     // char : 从平台设备获得驱动数据
     adc = platform_get_drvdata(pdev);
 
-    // hardware : 禁止时钟
-    clk_disable(adc->clk);
-
-    // hardware : 释放时钟
-    clk_put(adc->clk);
+    // hardware : 释放中断号
+    free_irq(adc->irqno, adc);
 
     // mknod : 删除设备文件
     device_destroy(adc_class, adc->cdev.dev);
@@ -287,6 +362,12 @@ int adc_remove(struct platform_device *pdev)
     // resource : 释放资源
     res = adc->res;
     release_mem_region(res->start, resource_size(res));
+
+    // hardware : 禁止时钟
+    clk_disable(adc->clk);
+
+    // hardware : 释放时钟
+    clk_put(adc->clk);
 
     // char : 释放内存
     kfree(adc);
