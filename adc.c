@@ -91,11 +91,18 @@ int adc_release(struct inode *inode, struct file *filp)
 ssize_t adc_read(struct file *filp, char __user *buf, size_t count, loff_t *f_ops)
 {
     ssize_t ret;
+    int data;
+    struct adc_cdev *adc = filp->private_data; 
     printk("%s\n", __func__);
-    ret = copy_to_user(buf, "Hello world\n", 13);
+    ret = copy_to_user(buf, adc->regs + ADCDAT, 32);
     if (0 != ret){
         ret = -EFAULT;
     }
+    data = atoi(buf);
+    data &= (0xfff);
+
+
+
     return ret;
 }
 // char : adc_ioctl
